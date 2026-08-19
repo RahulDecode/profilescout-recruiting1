@@ -5,14 +5,14 @@ export async function POST(req) {
     if (!jobDescription.trim())
       return Response.json({ error: "Job description is required." }, { status: 400 });
 
-    const key = process.env.SERPER_API_KEY;
+    const key = process.env.BRAVE_API_KEY;
     if (!key)
       return Response.json(
-        { error: "Search provider is not configured.", code: "SERPER_API_KEY_MISSING" },
+        { error: "Search provider is not configured.", code: "BRAVE_API_KEY_MISSING" },
         { status: 503 }
       );
 
-    // ── Clean job title: strip special chars that break Serper quoted queries ──
+    // ── Clean job title: strip special chars that break search queries ────────
     const cleanTitle = jobTitle
       .split(/[-–—|]/)[0]
       .replace(/[^a-zA-Z0-9 &]/g, "")
@@ -29,57 +29,55 @@ export async function POST(req) {
     const hints = HINT_POOL.filter((t) => hay.includes(t)).slice(0, 5);
     const safeLoc = location?.trim() ? `"${location.trim()}"` : "";
 
-    // ── Single combined query to conserve API credits ────────────────────────
-    // Format: site:linkedin.com/in "Job Title" "hint1" "hint2" "Location"
+    // ── Build query ───────────────────────────────────────────────────────────
     const hintPart = hints.slice(0, 2).map(h => `"${h}"`).join(" ");
     const q = `site:linkedin.com/in "${cleanTitle}" ${hintPart} ${safeLoc}`
       .replace(/\s+/g, " ").trim();
 
-    const queries = [q];
-
-    // ── Fire single Serper request ───────────────────────────────────────────
+    // ── Call Brave Search API ─────────────────────────────────────────────────
     let sr;
     try {
-      sr = await fetch("https://google.serper.dev/search", {
-        method: "POST",
+      const url = new URL("https://api.search.brave.com/res/v1/web/search");
+      url.searchParams.set("q", q);
+      url.searchParams.set("count", "20");
+      url.searchParams.set("search_lang", "en");
+      url.searchParams.set("country", "IN");
+      url.searchParams.set("text_decorations", "false");
+
+      sr = await fetch(url.toString(), {
+        method: "GET",
         headers: {
-          "X-API-KEY": key,
-          "Content-Type": "application/json",
+          "Accept": "application/json",
+          "Accept-Encoding": "gzip",
+          "X-Subscription-Token": key,
         },
-        body: JSON.stringify({ q, num: 20, gl: "in", hl: "en" }),
       });
     } catch (fetchErr) {
-      console.error("[ProfileScout] Network error calling Serper:", fetchErr.message);
+      console.error("[ProfileScout] Network error calling Brave:", fetchErr.message);
       return Response.json({ error: "Network error reaching search provider." }, { status: 502 });
     }
 
     if (!sr.ok) {
-      let serperErrorBody = "";
-      try { serperErrorBody = await sr.text(); } catch (_) {}
-      console.error(`[ProfileScout] Serper ${sr.status} for query "${q}":`, serperErrorBody);
+      let errorBody = "";
+      try { errorBody = await sr.text(); } catch (_) {}
+      console.error(`[ProfileScout] Brave ${sr.status} for query "${q}":`, errorBody);
 
-      // Friendly messages for common status codes
       const friendlyError =
-        sr.status === 429 || sr.status === 402
-          ? "Search quota exceeded. Please upgrade your Serper plan at serper.dev."
+        sr.status === 429
+          ? "Search quota exceeded. You have used your free Brave API limit for this month."
           : sr.status === 401 || sr.status === 403
-          ? "Invalid Serper API key. Please check your SERPER_API_KEY in Vercel settings."
-          : `Search provider returned ${sr.status}: ${serperErrorBody}`;
+          ? "Invalid Brave API key. Please check BRAVE_API_KEY in Vercel settings."
+          : `Search provider returned ${sr.status}: ${errorBody}`;
 
       return Response.json(
-        { error: friendlyError, serper_status: sr.status, serper_error: serperErrorBody, failed_query: q },
+        { error: friendlyError, status: sr.status, detail: errorBody, failed_query: q },
         { status: 502 }
       );
     }
 
     const payload = await sr.json();
 
-    // ── Log remaining credits ────────────────────────────────────────────────
-    const remaining = sr.headers.get("x-ratelimit-remaining");
-    const limit = sr.headers.get("x-ratelimit-limit");
-    console.log(`[ProfileScout] Serper credits: ${remaining}/${limit} remaining`);
-
-    // ── Parse results ────────────────────────────────────────────────────────
+    // ── Parse Brave results ───────────────────────────────────────────────────
     const normalizeLinkedIn = (url) => {
       try {
         const u = new URL(url);
@@ -94,23 +92,25 @@ export async function POST(req) {
       t.split(" - ")[0].split(" | ")[0].replace(/\s+\|\s+LinkedIn.*$/i, "").trim();
 
     const score = (r) => {
-      const txt = `${r.title || ""} ${r.snippet || ""}`.toLowerCase();
+      const txt = `${r.title || ""} ${r.description || ""}`.toLowerCase();
       const hits = hints.filter((t) => txt.includes(t)).length;
       return Math.min(99, 60 + hits * 7);
     };
 
+    // Brave returns results under payload.web.results
+    const organicResults = payload?.web?.results || [];
     const results = [];
-    for (const r of payload.organic || []) {
-      const url = normalizeLinkedIn(r.link || "");
+
+    for (const r of organicResults) {
+      const url = normalizeLinkedIn(r.url || "");
       if (!url) continue;
       results.push({
         linkedin_url: url,
         full_name: nameFromTitle(r.title || ""),
         headline: r.title || "",
-        snippet: r.snippet || "",
+        snippet: r.description || "",
         source_query: q,
         match_score: score(r),
-        credits_remaining: remaining ? parseInt(remaining) : null,
       });
     }
 
@@ -122,8 +122,8 @@ export async function POST(req) {
     }
 
     return Response.json({
-      queries,
-      credits_remaining: remaining ? parseInt(remaining) : null,
+      queries: [q],
+      provider: "brave",
       profiles: [...dedup.values()]
         .sort((a, b) => b.match_score - a.match_score)
         .slice(0, 50),
