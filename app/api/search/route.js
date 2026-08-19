@@ -5,12 +5,10 @@ export async function POST(req) {
     if (!jobDescription.trim())
       return Response.json({ error: "Job description is required." }, { status: 400 });
 
-    const key = process.env.GOOGLE_CSE_KEY;
-    const cx  = process.env.GOOGLE_CSE_CX;
-
-    if (!key || !cx)
+    const key = process.env.SERPAPI_KEY;
+    if (!key)
       return Response.json(
-        { error: "Search provider is not configured.", code: "GOOGLE_CSE_MISSING" },
+        { error: "Search provider is not configured.", code: "SERPAPI_KEY_MISSING" },
         { status: 503 }
       );
 
@@ -32,39 +30,36 @@ export async function POST(req) {
     const safeLoc = location?.trim() ? `"${location.trim()}"` : "";
     const hintPart = hints.slice(0, 2).map(h => `"${h}"`).join(" ");
 
-    // ── Single query — Google CSE searches linkedin.com/in/* by default ──────
-    const q = `"${cleanTitle}" ${hintPart} ${safeLoc}`
+    const q = `site:linkedin.com/in "${cleanTitle}" ${hintPart} ${safeLoc}`
       .replace(/\s+/g, " ").trim();
 
-    // ── Call Google Custom Search API ─────────────────────────────────────────
+    // ── Call SerpApi ──────────────────────────────────────────────────────────
     let sr;
     try {
-      const url = new URL("https://www.googleapis.com/customsearch/v1");
-      url.searchParams.set("key", key);
-      url.searchParams.set("cx", cx);
+      const url = new URL("https://serpapi.com/search");
+      url.searchParams.set("engine", "google");
       url.searchParams.set("q", q);
-      url.searchParams.set("num", "10"); // max 10 per request on free tier
+      url.searchParams.set("num", "20");
       url.searchParams.set("gl", "in");
       url.searchParams.set("hl", "en");
+      url.searchParams.set("api_key", key);
 
       sr = await fetch(url.toString());
     } catch (fetchErr) {
-      console.error("[ProfileScout] Network error calling Google CSE:", fetchErr.message);
+      console.error("[ProfileScout] Network error calling SerpApi:", fetchErr.message);
       return Response.json({ error: "Network error reaching search provider." }, { status: 502 });
     }
 
     if (!sr.ok) {
       let errorBody = "";
       try { errorBody = await sr.text(); } catch (_) {}
-      console.error(`[ProfileScout] Google CSE ${sr.status} for query "${q}":`, errorBody);
+      console.error(`[ProfileScout] SerpApi ${sr.status} for query "${q}":`, errorBody);
 
       const friendlyError =
         sr.status === 429
-          ? "Daily search quota exceeded (100 searches/day on free tier). Try again tomorrow."
-          : sr.status === 400
-          ? "Invalid search configuration. Please check GOOGLE_CSE_KEY and GOOGLE_CSE_CX in Vercel settings."
-          : sr.status === 403
-          ? "Google API key invalid or Custom Search API not enabled. Check console.cloud.google.com."
+          ? "Monthly search quota exceeded (100 searches/month on free plan). Upgrade at serpapi.com."
+          : sr.status === 401 || sr.status === 403
+          ? "Invalid SerpApi key. Please check SERPAPI_KEY in Vercel settings."
           : `Search provider returned ${sr.status}: ${errorBody}`;
 
       return Response.json(
@@ -75,7 +70,18 @@ export async function POST(req) {
 
     const payload = await sr.json();
 
-    // ── Parse Google CSE results ──────────────────────────────────────────────
+    // Check for SerpApi-level errors (they return 200 with error field sometimes)
+    if (payload.error) {
+      console.error("[ProfileScout] SerpApi error:", payload.error);
+      return Response.json(
+        { error: payload.error.includes("credit") || payload.error.includes("plan")
+            ? "Search quota exhausted. Upgrade at serpapi.com."
+            : payload.error },
+        { status: 502 }
+      );
+    }
+
+    // ── Parse results ─────────────────────────────────────────────────────────
     const normalizeLinkedIn = (url) => {
       try {
         const u = new URL(url);
@@ -95,10 +101,10 @@ export async function POST(req) {
       return Math.min(99, 60 + hits * 7);
     };
 
-    const items = payload?.items || [];
+    const organicResults = payload?.organic_results || [];
     const results = [];
 
-    for (const r of items) {
+    for (const r of organicResults) {
       const url = normalizeLinkedIn(r.link || "");
       if (!url) continue;
       results.push({
@@ -120,8 +126,7 @@ export async function POST(req) {
 
     return Response.json({
       queries: [q],
-      provider: "google-cse",
-      total_results: payload?.searchInformation?.totalResults || "0",
+      provider: "serpapi",
       profiles: [...dedup.values()]
         .sort((a, b) => b.match_score - a.match_score)
         .slice(0, 50),
