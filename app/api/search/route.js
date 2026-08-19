@@ -5,20 +5,22 @@ export async function POST(req) {
     if (!jobDescription.trim())
       return Response.json({ error: "Job description is required." }, { status: 400 });
 
-    const key = process.env.BRAVE_API_KEY;
-    if (!key)
+    const key = process.env.GOOGLE_CSE_KEY;
+    const cx  = process.env.GOOGLE_CSE_CX;
+
+    if (!key || !cx)
       return Response.json(
-        { error: "Search provider is not configured.", code: "BRAVE_API_KEY_MISSING" },
+        { error: "Search provider is not configured.", code: "GOOGLE_CSE_MISSING" },
         { status: 503 }
       );
 
-    // ── Clean job title: strip special chars that break search queries ────────
+    // ── Clean job title ───────────────────────────────────────────────────────
     const cleanTitle = jobTitle
       .split(/[-–—|]/)[0]
       .replace(/[^a-zA-Z0-9 &]/g, "")
       .trim();
 
-    // ── Build keyword hints from JD ──────────────────────────────────────────
+    // ── Build keyword hints from JD ───────────────────────────────────────────
     const hay = `${jobTitle} ${jobDescription}`.toLowerCase();
     const HINT_POOL = [
       "inside sales", "b2b saas", "saas", "sales development", "sdr",
@@ -28,45 +30,41 @@ export async function POST(req) {
     ];
     const hints = HINT_POOL.filter((t) => hay.includes(t)).slice(0, 5);
     const safeLoc = location?.trim() ? `"${location.trim()}"` : "";
-
-    // ── Build query ───────────────────────────────────────────────────────────
     const hintPart = hints.slice(0, 2).map(h => `"${h}"`).join(" ");
-    const q = `site:linkedin.com/in "${cleanTitle}" ${hintPart} ${safeLoc}`
+
+    // ── Single query — Google CSE searches linkedin.com/in/* by default ──────
+    const q = `"${cleanTitle}" ${hintPart} ${safeLoc}`
       .replace(/\s+/g, " ").trim();
 
-    // ── Call Brave Search API ─────────────────────────────────────────────────
+    // ── Call Google Custom Search API ─────────────────────────────────────────
     let sr;
     try {
-      const url = new URL("https://api.search.brave.com/res/v1/web/search");
+      const url = new URL("https://www.googleapis.com/customsearch/v1");
+      url.searchParams.set("key", key);
+      url.searchParams.set("cx", cx);
       url.searchParams.set("q", q);
-      url.searchParams.set("count", "20");
-      url.searchParams.set("search_lang", "en");
-      url.searchParams.set("country", "IN");
-      url.searchParams.set("text_decorations", "false");
+      url.searchParams.set("num", "10"); // max 10 per request on free tier
+      url.searchParams.set("gl", "in");
+      url.searchParams.set("hl", "en");
 
-      sr = await fetch(url.toString(), {
-        method: "GET",
-        headers: {
-          "Accept": "application/json",
-          "Accept-Encoding": "gzip",
-          "X-Subscription-Token": key,
-        },
-      });
+      sr = await fetch(url.toString());
     } catch (fetchErr) {
-      console.error("[ProfileScout] Network error calling Brave:", fetchErr.message);
+      console.error("[ProfileScout] Network error calling Google CSE:", fetchErr.message);
       return Response.json({ error: "Network error reaching search provider." }, { status: 502 });
     }
 
     if (!sr.ok) {
       let errorBody = "";
       try { errorBody = await sr.text(); } catch (_) {}
-      console.error(`[ProfileScout] Brave ${sr.status} for query "${q}":`, errorBody);
+      console.error(`[ProfileScout] Google CSE ${sr.status} for query "${q}":`, errorBody);
 
       const friendlyError =
         sr.status === 429
-          ? "Search quota exceeded. You have used your free Brave API limit for this month."
-          : sr.status === 401 || sr.status === 403
-          ? "Invalid Brave API key. Please check BRAVE_API_KEY in Vercel settings."
+          ? "Daily search quota exceeded (100 searches/day on free tier). Try again tomorrow."
+          : sr.status === 400
+          ? "Invalid search configuration. Please check GOOGLE_CSE_KEY and GOOGLE_CSE_CX in Vercel settings."
+          : sr.status === 403
+          ? "Google API key invalid or Custom Search API not enabled. Check console.cloud.google.com."
           : `Search provider returned ${sr.status}: ${errorBody}`;
 
       return Response.json(
@@ -77,7 +75,7 @@ export async function POST(req) {
 
     const payload = await sr.json();
 
-    // ── Parse Brave results ───────────────────────────────────────────────────
+    // ── Parse Google CSE results ──────────────────────────────────────────────
     const normalizeLinkedIn = (url) => {
       try {
         const u = new URL(url);
@@ -92,23 +90,22 @@ export async function POST(req) {
       t.split(" - ")[0].split(" | ")[0].replace(/\s+\|\s+LinkedIn.*$/i, "").trim();
 
     const score = (r) => {
-      const txt = `${r.title || ""} ${r.description || ""}`.toLowerCase();
+      const txt = `${r.title || ""} ${r.snippet || ""}`.toLowerCase();
       const hits = hints.filter((t) => txt.includes(t)).length;
       return Math.min(99, 60 + hits * 7);
     };
 
-    // Brave returns results under payload.web.results
-    const organicResults = payload?.web?.results || [];
+    const items = payload?.items || [];
     const results = [];
 
-    for (const r of organicResults) {
-      const url = normalizeLinkedIn(r.url || "");
+    for (const r of items) {
+      const url = normalizeLinkedIn(r.link || "");
       if (!url) continue;
       results.push({
         linkedin_url: url,
         full_name: nameFromTitle(r.title || ""),
         headline: r.title || "",
-        snippet: r.description || "",
+        snippet: r.snippet || "",
         source_query: q,
         match_score: score(r),
       });
@@ -123,7 +120,8 @@ export async function POST(req) {
 
     return Response.json({
       queries: [q],
-      provider: "brave",
+      provider: "google-cse",
+      total_results: payload?.searchInformation?.totalResults || "0",
       profiles: [...dedup.values()]
         .sort((a, b) => b.match_score - a.match_score)
         .slice(0, 50),
