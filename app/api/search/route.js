@@ -14,8 +14,8 @@ export async function POST(req) {
 
     // ── Clean job title: strip special chars that break Serper quoted queries ──
     const cleanTitle = jobTitle
-      .split(/[-–—|]/)[0]           // take only part before hyphen/dash/pipe
-      .replace(/[^a-zA-Z0-9 &]/g, "") // strip remaining special chars
+      .split(/[-–—|]/)[0]
+      .replace(/[^a-zA-Z0-9 &]/g, "")
       .trim();
 
     // ── Build keyword hints from JD ──────────────────────────────────────────
@@ -26,39 +26,60 @@ export async function POST(req) {
       "crm", "us market", "global markets", "sales manager", "account executive",
       "revenue operations", "enterprise sales", "solution selling",
     ];
-    const hints = HINT_POOL.filter((t) => hay.includes(t)).slice(0, 8);
-
-    // ── Build queries — always safe, non-empty q strings ────────────────────
+    const hints = HINT_POOL.filter((t) => hay.includes(t)).slice(0, 5);
     const safeLoc = location?.trim() ? `"${location.trim()}"` : "";
 
-    const rawQueries = [
-      // Q1: clean title + location (no nested special chars)
-      cleanTitle
-        ? `site:linkedin.com/in "${cleanTitle}" ${safeLoc}`
-        : null,
-      // Q2: first 3 hints
-      hints.length > 0
-        ? `site:linkedin.com/in ${hints.slice(0, 3).map((h) => `"${h}"`).join(" ")} ${safeLoc}`
-        : null,
-      // Q3: next 3 hints (only if enough hints exist)
-      hints.length > 3
-        ? `site:linkedin.com/in ${hints.slice(2, 5).map((h) => `"${h}"`).join(" ")} ${safeLoc}`
-        : null,
-    ]
-      .filter(Boolean)
-      .map((q) => q.replace(/\s+/g, " ").trim())
-      .filter((q) => q.length > 20);
+    // ── Single combined query to conserve API credits ────────────────────────
+    // Format: site:linkedin.com/in "Job Title" "hint1" "hint2" "Location"
+    const hintPart = hints.slice(0, 2).map(h => `"${h}"`).join(" ");
+    const q = `site:linkedin.com/in "${cleanTitle}" ${hintPart} ${safeLoc}`
+      .replace(/\s+/g, " ").trim();
 
-    const queries = [...new Set(rawQueries)];
+    const queries = [q];
 
-    if (queries.length === 0) {
+    // ── Fire single Serper request ───────────────────────────────────────────
+    let sr;
+    try {
+      sr = await fetch("https://google.serper.dev/search", {
+        method: "POST",
+        headers: {
+          "X-API-KEY": key,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ q, num: 20, gl: "in", hl: "en" }),
+      });
+    } catch (fetchErr) {
+      console.error("[ProfileScout] Network error calling Serper:", fetchErr.message);
+      return Response.json({ error: "Network error reaching search provider." }, { status: 502 });
+    }
+
+    if (!sr.ok) {
+      let serperErrorBody = "";
+      try { serperErrorBody = await sr.text(); } catch (_) {}
+      console.error(`[ProfileScout] Serper ${sr.status} for query "${q}":`, serperErrorBody);
+
+      // Friendly messages for common status codes
+      const friendlyError =
+        sr.status === 429 || sr.status === 402
+          ? "Search quota exceeded. Please upgrade your Serper plan at serper.dev."
+          : sr.status === 401 || sr.status === 403
+          ? "Invalid Serper API key. Please check your SERPER_API_KEY in Vercel settings."
+          : `Search provider returned ${sr.status}: ${serperErrorBody}`;
+
       return Response.json(
-        { error: "Could not build a valid search query. Please add more detail to the job description." },
-        { status: 400 }
+        { error: friendlyError, serper_status: sr.status, serper_error: serperErrorBody, failed_query: q },
+        { status: 502 }
       );
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    const payload = await sr.json();
+
+    // ── Log remaining credits ────────────────────────────────────────────────
+    const remaining = sr.headers.get("x-ratelimit-remaining");
+    const limit = sr.headers.get("x-ratelimit-limit");
+    console.log(`[ProfileScout] Serper credits: ${remaining}/${limit} remaining`);
+
+    // ── Parse results ────────────────────────────────────────────────────────
     const normalizeLinkedIn = (url) => {
       try {
         const u = new URL(url);
@@ -66,9 +87,7 @@ export async function POST(req) {
         u.search = "";
         u.hash = "";
         return u.toString().replace(/\/$/, "");
-      } catch {
-        return null;
-      }
+      } catch { return null; }
     };
 
     const nameFromTitle = (t = "") =>
@@ -80,53 +99,19 @@ export async function POST(req) {
       return Math.min(99, 60 + hits * 7);
     };
 
-    // ── Fire Serper requests ──────────────────────────────────────────────────
     const results = [];
-
-    for (const q of queries) {
-      let sr;
-      try {
-        sr = await fetch("https://google.serper.dev/search", {
-          method: "POST",
-          headers: {
-            "X-API-KEY": key,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ q, num: 20, gl: "us", hl: "en" }),
-        });
-      } catch (fetchErr) {
-        console.error("[ProfileScout] Network error calling Serper:", fetchErr.message);
-        continue;
-      }
-
-      if (!sr.ok) {
-        let serperErrorBody = "";
-        try { serperErrorBody = await sr.text(); } catch (_) {}
-        console.error(`[ProfileScout] Serper ${sr.status} for query "${q}":`, serperErrorBody);
-        return Response.json(
-          {
-            error: `Search provider returned ${sr.status}`,
-            serper_status: sr.status,
-            serper_error: serperErrorBody,
-            failed_query: q,
-          },
-          { status: 502 }
-        );
-      }
-
-      const payload = await sr.json();
-      for (const r of payload.organic || []) {
-        const url = normalizeLinkedIn(r.link || "");
-        if (!url) continue;
-        results.push({
-          linkedin_url: url,
-          full_name: nameFromTitle(r.title || ""),
-          headline: r.title || "",
-          snippet: r.snippet || "",
-          source_query: q,
-          match_score: score(r),
-        });
-      }
+    for (const r of payload.organic || []) {
+      const url = normalizeLinkedIn(r.link || "");
+      if (!url) continue;
+      results.push({
+        linkedin_url: url,
+        full_name: nameFromTitle(r.title || ""),
+        headline: r.title || "",
+        snippet: r.snippet || "",
+        source_query: q,
+        match_score: score(r),
+        credits_remaining: remaining ? parseInt(remaining) : null,
+      });
     }
 
     // ── Deduplicate & rank ────────────────────────────────────────────────────
@@ -138,10 +123,12 @@ export async function POST(req) {
 
     return Response.json({
       queries,
+      credits_remaining: remaining ? parseInt(remaining) : null,
       profiles: [...dedup.values()]
         .sort((a, b) => b.match_score - a.match_score)
         .slice(0, 50),
     });
+
   } catch (e) {
     console.error("[ProfileScout] Unhandled error:", e);
     return Response.json({ error: e?.message || "Search failed." }, { status: 500 });
