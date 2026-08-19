@@ -12,6 +12,12 @@ export async function POST(req) {
         { status: 503 }
       );
 
+    // ── Clean job title: strip special chars that break Serper quoted queries ──
+    const cleanTitle = jobTitle
+      .split(/[-–—|]/)[0]           // take only part before hyphen/dash/pipe
+      .replace(/[^a-zA-Z0-9 &]/g, "") // strip remaining special chars
+      .trim();
+
     // ── Build keyword hints from JD ──────────────────────────────────────────
     const hay = `${jobTitle} ${jobDescription}`.toLowerCase();
     const HINT_POOL = [
@@ -22,27 +28,35 @@ export async function POST(req) {
     ];
     const hints = HINT_POOL.filter((t) => hay.includes(t)).slice(0, 8);
 
-    // ── Build queries – always produce non-empty q strings ───────────────────
+    // ── Build queries — always safe, non-empty q strings ────────────────────
     const safeLoc = location?.trim() ? `"${location.trim()}"` : "";
-    const safeTitle = jobTitle.trim() ? `"${jobTitle.trim()}"` : "";
 
     const rawQueries = [
-      // Query 1 – title + location
-      `site:linkedin.com/in ${safeTitle} ${safeLoc}`,
-      // Query 2 – first 3 hints (only if we have at least 1)
+      // Q1: clean title + location (no nested special chars)
+      cleanTitle
+        ? `site:linkedin.com/in "${cleanTitle}" ${safeLoc}`
+        : null,
+      // Q2: first 3 hints
       hints.length > 0
         ? `site:linkedin.com/in ${hints.slice(0, 3).map((h) => `"${h}"`).join(" ")} ${safeLoc}`
         : null,
-      // Query 3 – next 3 hints (only if we have at least 4)
+      // Q3: next 3 hints (only if enough hints exist)
       hints.length > 3
         ? `site:linkedin.com/in ${hints.slice(2, 5).map((h) => `"${h}"`).join(" ")} ${safeLoc}`
         : null,
     ]
       .filter(Boolean)
       .map((q) => q.replace(/\s+/g, " ").trim())
-      .filter((q) => q.length > 20); // sanity-guard against near-empty queries
+      .filter((q) => q.length > 20);
 
     const queries = [...new Set(rawQueries)];
+
+    if (queries.length === 0) {
+      return Response.json(
+        { error: "Could not build a valid search query. Please add more detail to the job description." },
+        { status: 400 }
+      );
+    }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
     const normalizeLinkedIn = (url) => {
@@ -82,20 +96,13 @@ export async function POST(req) {
         });
       } catch (fetchErr) {
         console.error("[ProfileScout] Network error calling Serper:", fetchErr.message);
-        continue; // skip this query, try the next one
+        continue;
       }
 
       if (!sr.ok) {
-        // ── Capture Serper's actual error body for diagnostics ────────────────
         let serperErrorBody = "";
-        try {
-          serperErrorBody = await sr.text();
-        } catch (_) {}
-        console.error(
-          `[ProfileScout] Serper ${sr.status} for query "${q}":`,
-          serperErrorBody
-        );
-        // Return the Serper error body to the client so it shows in the UI
+        try { serperErrorBody = await sr.text(); } catch (_) {}
+        console.error(`[ProfileScout] Serper ${sr.status} for query "${q}":`, serperErrorBody);
         return Response.json(
           {
             error: `Search provider returned ${sr.status}`,
