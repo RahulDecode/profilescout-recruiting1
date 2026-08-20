@@ -1,10 +1,15 @@
-// TEMPORARY DEBUG ENDPOINT — remove after confirming env vars
 export async function GET() {
-  const key = process.env.SERPER_API_KEY || "";
+  const exaKey  = process.env.EXA_API_KEY  || "";
+  const bingKey = process.env.BING_API_KEY || "";
+  const serperKey = process.env.SERPER_API_KEY || "";
+
   return Response.json({
-    key_present: !!key,
-    key_length: key.length,
-    key_preview: key ? key.substring(0, 6) + "..." : "MISSING",
+    exa_key_present:    !!exaKey,
+    exa_key_length:     exaKey.length,
+    exa_key_preview:    exaKey   ? exaKey.substring(0, 8)   + "..." : "MISSING",
+    bing_key_present:   !!bingKey,
+    bing_key_preview:   bingKey  ? bingKey.substring(0, 8)  + "..." : "MISSING",
+    serper_key_present: !!serperKey,
     node_env: process.env.NODE_ENV,
   });
 }
